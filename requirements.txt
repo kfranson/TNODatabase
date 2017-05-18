@@ -7,5 +7,5 @@
 
 ephem
 pandas
-bumpy
+numpy
 calendar
