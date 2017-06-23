@@ -1,7 +1,7 @@
 TNODatabase
 ===============================
 
-version number: 0.0.7
+version number: 0.1.0
 author: Kyle Franson, Lynus Zullo
 
 Introduction
