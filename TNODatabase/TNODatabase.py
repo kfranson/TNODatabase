@@ -6,6 +6,8 @@ import ephem
 from Orbit import Orbit
 from calendar import monthrange
 from MPCRecord import MPCToTNO
+import TNOTools
+from astropy.coordinates import SkyCoord
 
 
 class Connect:
@@ -78,14 +80,31 @@ class Connect:
             if 'fakeid' not in can_table.columns:
                 # assume if no fakeid that object is real
                 can_table = can_table.assign(fakeid=pd.Series(np.zeros(len(can_table.index))))
+            if 'ccdnum' in can_table.columns:
+                can_table = can_table.rename(columns={'ccdnum': 'ccd'})
 
+            can_table['ccd'] = can_table.apply(lambda row:
+                                               TNOTools.compute_chip(SkyCoord(ra=str(row['ra']) + ' hour',
+                                                                           dec=str(row['dec']) + ' degree',
+                                                                           frame='icrs'),
+                                                                  row.expnum)[1] if row.ccd is None or
+                                                                                    row.ccd < 1 or
+                                                                                    row.ccd > 62
+                                               else row['ccd'], axis=1)
             index = []
 
             objid_index = []
+
+            can_table['se_objnum'] = None
             for i, row in can_table.iterrows():
 
                 if not (self.__comment(row) or self.__duplicate_obs(row)):
                     index.append(i)
+
+                    if self.__extended_obj_id(row['objid']):
+                        can_table = can_table.set_value(i, 'se_objnum', int(row['objid']))
+                        can_table = can_table.set_value(i, 'objid', 0)
+                        row['objid'] = 0
 
                     if not self.__valid_obj_id(row['objid']):
                         objid_index.append(i)
@@ -99,13 +118,15 @@ class Connect:
                 j += 1
 
             canid = self.__find_canid(can_table, season, name, prepend_cand_info)
+
             orbid = self.__create_orbit_id()
 
-            orbcmd = self.__write_orb(can_table, canid, orbid, designation=designation)
+            orbcmd, rm_orbcmd = self.__write_orb(can_table, canid, orbid, designation=designation)
 
-            linkcmds = self.__write_linker(canid, can_table, orbid)
+            linkcmds, rm_linkcmds = self.__write_linker(canid, can_table, orbid)
 
-            objcmds = self.__write_obs(index, can_table)
+            objcmds, rm_objcmds = self.__write_obs(index, can_table)
+
 
             if not designation:
                 statcmd = ("INSERT INTO LZULLO.TNOSTAT(ID, EXTENDED, VISUAL, ACCEPT, QUAL_FLAG, INSPECT_TIME, ANALYST, "
@@ -117,21 +138,31 @@ class Connect:
                            "'LZULLO', 'KNOWN_OBJECT')")
             # cursor.execute(candcmd)
 
+            rm_cmds = []
+            i = 0
             try:
                 cursor.execute(orbcmd)
+                i += 1
             except:
                 raise RuntimeError("Orbit Command Failure\n" + orbcmd)
 
+            rm_cmds += rm_orbcmd
+            rm_cmds += rm_linkcmds
             for l in linkcmds:
                 try:
                     cursor.execute(l)
+                    i += 1
                 except:
+                    self.__safe_error(rm_cmds[:i])
                     raise RuntimeError("Link Command Failure\n" + l)
 
+            rm_cmds += rm_objcmds
             for o in objcmds:
                 try:
                     cursor.execute(o)
+                    i += 1
                 except:
+                    self.__safe_error(rm_cmds[:i])
                     raise RuntimeError("Object Command Failure\n" + o)
             try:
                 cursor.execute(statcmd)
@@ -181,6 +212,12 @@ class Connect:
     #                 if output_obs[i]:
     #                     if
     #
+
+    def __safe_error(self, rm_cmds):
+        cursor = self.desoper.cursor()
+        for r in rm_cmds:
+            cursor.execute(r)
+
 
     def get_values(self, table, column, value):
         """
@@ -236,6 +273,39 @@ class Connect:
             cursor = self.desoper.cursor()
             cursor.execute(cmd)
 
+    def set_quality_flag(self, canid, flag):
+        cursor = self.desoper.cursor()
+        cmd = "UPDATE LZULLO.TNOSTAT SET QUAL_FLAG = '" + str(flag) + "' WHERE ID = '" + str(canid) + "'"
+        try:
+            cursor.execute(cmd)
+            str(canid) + " quality flag set to " + str(flag)
+        except:
+            raise RuntimeError("Command Failed")
+
+    def addObstoCan(self, canid, obs_df):
+        cursor = self.desoper.cursor()
+        cmd = "SELECT * FROM LZULLO.TNOLINK WHERE ID= '" + str(canid) + "'"
+
+        existing_df = pd.query_to_pandas(cmd)
+        for i, row in existing_df.iterrows():
+            orbid = i['ORBID']
+
+        #Writes the observations
+        index = []
+        for i, row in obs_df.iterrows():
+            if not (self.__comment(row) or self.__duplicate_obs(row)):
+                index.append(i)
+
+        self.__write_obs(obs_df, index)
+
+        #Inserts into linker with same ORBID
+        for i, row in obs_df.iterrows():
+            linkcmd = ("INSERT INTO LZULLO.TNOLINK(ID, OBJID, ORBID) VALUES ('" + str(canid) + "','" + obs_df['OBJID'][i] + "','" +
+                 orbid + "')")
+            cursor.execute(linkcmd)
+
+
+
     # private helper methods
     # -------------------------
 
@@ -253,24 +323,28 @@ class Connect:
         """
 
         linkcmds = []
+        rm_linkcmds = []
         for index, row in can_table.iterrows():
             if not self.__comment(row):
                 linkcmds += ["INSERT INTO LZULLO.TNOLINK (ID, OBJID, ORBID) \
                 VALUES ('" + canid + "', " + str(can_table['objid'][index]) + ", " + orbid + ")"]
+                rm_linkcmds += ("DELETE FROM LZULLO.TNOLINK WHERE (ID, OBJID, ORBID) = ('" + canid +
+                                "', " + str(can_table['objid'][index]) + ", " + orbid + ")")
 
-        return linkcmds
+        return linkcmds, rm_linkcmds
 
     def __write_obs(self, index, can_table):
         """
         
         Args:
-            index: A dataframe of new observations not in LZULLO.TNOBS
+            index: A list of indices that are to be added
             can_table: Dataframe of candidate observations
 
         Returns:
             List of commands that insert a new observation into TNOBS
         """
         objcmds = []
+        rm_objcmds = []
 
         if 'date' not in can_table.columns:
             raise RuntimeError("Candidate table must have column 'date'")
@@ -290,7 +364,7 @@ class Connect:
             ra = "'" + str(can_table['ra'][i]) + "'"
             dec = "'" + str(can_table['dec'][i]) + "'"
 
-            expnum = str(can_table['expnum'][i]) if 'expnum' in can_table.columns else "NULL"
+            expnum = str(int(can_table['expnum'][i])) if 'expnum' in can_table.columns else "NULL"
 
             exptime = str(can_table['exptime'][i]) if 'exptime' in can_table.columns else "NULL"
 
@@ -314,38 +388,53 @@ class Connect:
             if not fwhm.replace('.', '', 1).isdigit():
                 fwhm = "NULL"
 
-            objid = str(can_table['objid'][i])
+            objid = str(int(can_table['objid'][i]))
+            se_objnum = str(int(can_table['se_objnum'][i])) if can_table['se_objnum'][i] else "NULL"
 
             year = self.__find_year(can_table['date'][i])
 
             # DESTEST information
-            destest_list = self.__access_destest(objid)
+            if se_objnum != "NULL" and expnum != "NULL" and ccd != "NULL" and band != "NULL":
+                extras_list = self.__access_se_cat(se_objnum, expnum, ra.strip("'"), dec.strip("'"), ccd, band)
+            else:
+                extras_list = self.__access_destest(objid, int(expnum))
 
-            if len(destest_list) > 0:
-                nite = destest_list.iloc[0]['NITE']
-                flux = destest_list.iloc[0]['FLUX']
-                flux_err = destest_list.iloc[0]['FLUX_ERR']
-                season = destest_list.iloc[0]['SEASON']
+            if len(extras_list) > 0:
+                nite = str(extras_list.iloc[0]['NITE'])
+                flux = str(extras_list.iloc[0]['FLUX'])
+                flux_err = str(extras_list.iloc[0]['FLUX_ERR'])
+                season = str(extras_list.iloc[0]['SEASON'])
+                spread_model = str(extras_list.iloc[0]['SPREAD_MODEL'])
+                spreaderr_model = str(extras_list.iloc[0]['SPREADERR_MODEL'])
+                new_ccd = str(extras_list.iloc[0]['CCD'])
+                if new_ccd != ccd:
+                    print("Fixed CCD on observation " + str(i))
+                    ccd = new_ccd
+
             else:
                 nite = "NULL"
                 flux = "NULL"
                 flux_err = "NULL"
                 season = "NULL"
+                spread_model = "NULL"
+                spreaderr_model = "NULL"
 
             if not str(can_table['fakeid'][i]).replace('.', '', 1).isdigit():
                 fakeid = "NULL"
-            elif not (can_table['fakeid'][i] == 0 or can_table['fakeid'][i] > 1):
+            elif not (can_table['fakeid'][i] >= 0):
                 raise RuntimeError("fakeid must be 0 or a positive value")
             else:
-                fakeid = can_table['fakeid'][i]
+                fakeid = int(can_table['fakeid'][i])
 
             objcmds += ["INSERT INTO lzullo.TNOBS (DATE_OBS, RA, DEC, EXPNUM, EXPTIME, BAND, CCD, MAG , ML_SCORE, "
-                        "OBJID, FAKEID, NITE, FLUX, FLUX_ERR, SEASON, YEAR, PIXELX, PIXELY, FWHM ) VALUES (" + date_obs
-                        + "," + ra + "," + dec + "," + expnum + "," + exptime + "," + band + "," + ccd + "," + mag + ","
-                        + ml_score + "," + objid + "," + str(fakeid) + "," + nite + "," + str(flux) + "," +
-                        str(flux_err) + "," + str(season) + "," + str(year) + "," + pixelx + "," + pixely
-                        + "," + fwhm + ")"]
-        return objcmds
+                        "OBJID, FAKEID, NITE, FLUX, FLUX_ERR, SEASON, YEAR, PIXELX, PIXELY, FWHM, SE_OBJNUM, " +
+                        "SPREAD_MODEL, SPREADERR_MODEL) VALUES (" + date_obs + "," + ra + "," + dec + "," + expnum +
+                        "," + exptime + "," + band + "," + ccd + "," + mag + "," + ml_score + "," + objid + "," +
+                        str(fakeid) + "," + nite + "," + str(flux) + "," + str(flux_err) + "," + str(season) + "," +
+                        str(year) + "," + pixelx + "," + pixely + "," + fwhm + "," + se_objnum + "," +
+                        spread_model + "," + spreaderr_model + ")"]
+            rm_objcmds += "DELETE FROM LZULLO.TNOBS WHERE OBJID = " + objid
+        return objcmds, rm_objcmds
 
     def __write_orb(self, can_table, canid, orbid, designation=""):
         """
@@ -430,7 +519,8 @@ class Connect:
              "','" + abg_g_err + "','" + abg_adot_err + "','" + abg_bdot_err + "','" + abg_gdot_err + "'," + orbid +
              ",'" + designation + "')")
 
-        return c
+        rm_c = "DELETE FROM LZULLO.TNORBIT WHERE ORBID = " + str(orbid)
+        return c, rm_c
 
     def __duplicate_obs(self, observation):
         """
@@ -448,6 +538,7 @@ class Connect:
                 "' AND LZULLO.TNOBS.DEC = '" + str(observation['dec']) + "'"
 
         results = pd.read_sql(query, self.desoper)
+
         return not results.empty
 
     def __duplicate_orbit(self, a, e, inc):
@@ -483,7 +574,7 @@ class Connect:
         return observation['date'].startswith('#')
 
     # Returns a Dataframe of necessary information from DESTEST
-    def __access_destest(self, objid):
+    def __access_destest(self, objid, expnum):
         """
         
         Args:
@@ -492,10 +583,46 @@ class Connect:
         Returns:
             Finds all the necessary information for a given observation from DESTEST 
         """
-        query = "SELECT NITE, SEASON, FLUX, FLUX_ERR  FROM WSDIFF.SNOBS WHERE SNOBJID =" + objid
+        query = "SELECT EXPNUM, NITE, SEASON, FLUX, FLUX_ERR, SPREAD_MODEL, SPREADERR_MODEL, CCDNUM as CCD FROM WSDIFF.SNOBS WHERE SNOBJID =" + objid
         data_list = pd.read_sql(query, self.destest)
+        if len(data_list) == 0:
+            return data_list
+        elif data_list['EXPNUM'].iloc[0] != expnum:
+            data_list.drop(data_list.index, inplace=True)
 
         return data_list
+
+    def __access_se_cat(self, objid, expnum, ra, dec, ccd, band):
+        """
+
+        :param objid:
+        :param expnum:
+        :param ra: string representing ra in 'hh:mm:ss' format
+        :param dec: string representing dec in 'dd:mm:ss' format
+        :param ccd:
+        :param band:
+        :return:
+        """
+        coord = SkyCoord(ra=ra + " hour", dec=dec + " degree", frame='icrs')
+
+        query = ("SELECT FILENAME, RA, DEC, NITE, FLUX_AUTO, FLUXERR_AUTO, SPREAD_MODEL, SPREADERR_MODEL FROM PROD.SE_OBJECT " +
+                 "WHERE FILENAME LIKE 'D00" + expnum + "_" + band[1] + "_c%' AND OBJECT_NUMBER = " +
+                 objid)
+        # " + ccd.zfill(2) + "%'
+
+        df = self.desoper.query_to_pandas(query)
+        if len(df) == 0:
+            return df
+
+        df_near = df[np.isclose(df.RA, np.ones(df.RA.shape) * coord.ra.degree) &
+                     np.isclose(df.DEC, np.ones(df.DEC.shape) * coord.dec.degree)]
+        assert len(df_near) == 1 or len(df_near) == 0
+
+        df_near = df_near.rename(columns={'FLUX_AUTO': 'FLUX', 'FLUXERR_AUTO': 'FLUX_ERR'})
+        df_near['SEASON'] = "NULL"
+        df_near['CCD'] = df_near.FILENAME.str[13:15]
+        df_near.CCD = df_near.CCD.apply(int)
+        return df_near
 
     @staticmethod
     def __fit_orbit(df_obs):
@@ -667,6 +794,17 @@ class Connect:
             return False
 
         return True
+
+    @staticmethod
+    def __extended_obj_id(objid):
+
+        if ((type(objid) == float or
+             type(objid) == str or
+             type(objid) == int) and
+           0 < float(objid) < 119321):
+            return True
+        else:
+            return False
 
     def __del__(self):
         self.desoper.close()
