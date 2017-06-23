@@ -218,10 +218,17 @@ class Connect:
         for r in rm_cmds:
             cursor.execute(r)
 
+    def get_obs(self, canid):
+
+        query = "SELECT DISTINCT DATE_OBS, RA, DEC, EXPNUM, BAND, CCD, MAG, ML_SCORE, TNOBS.OBJID from " \
+            "LZULLO.TNOBS INNER JOIN LZULLO.TNOLINK ON TNOBS.OBJID=TNOLINK.OBJID WHERE TNOLINK.ID= '" + canid + "'"
+
+        result = self.desoper.query_to_pandas(query)
+        return result
 
     def get_values(self, table, column, value):
         """
-        Gets values from table with column = value. Equivalent to 
+            Gets values from table with column = value. Equivalent to
             'SELECT * FROM LZULLO.[table] WHERE [column] = [value]'
         Args:
             table (str): table to get values from
