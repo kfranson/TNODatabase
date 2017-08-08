@@ -1,14 +1,14 @@
 TNODatabase
 ===============================
 
-version number: 0.1.1
+version number: 0.2.0
 author: Kyle Franson, Lynus Zullo
 
 Introduction
 ------------
 
 -  This package allows for easy user interface with the TNO database set
-   up on DESOPER.
+   up on DESSCI.
 -  Gives users the ability to add or remove candidates and see relevant
    information regarding both observations and orbits.
 
