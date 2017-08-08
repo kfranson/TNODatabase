@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 from codecs import open
 from os import path
 
-__version__ = '0.1.1'
+__version__ = '0.2.0'
 
 here = path.abspath(path.dirname(__file__))
 
@@ -20,7 +20,7 @@ dependency_links = [x.strip().replace('git+', '') for x in all_reqs if x.startsw
 setup(
     name='TNODatabase',
     version=__version__,
-    description='Python module for interacting with Trans-Neptunian Object Database on DESOPER. Use requires a working DES username & password.',
+    description='Python module for interacting with Trans-Neptunian Object Database on DESSCI. Use requires a working DES username & password.',
     long_description=long_description,
     url='https://github.com/kfranson/TNODatabase',
     download_url='https://github.com/kfranson/TNODatabase/tarball/' + __version__,
